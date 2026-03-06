@@ -122,6 +122,11 @@ const config = {
 		}),
 };
 
+function ts() {
+	return `[${new Date().toLocaleTimeString()}]`;
+}
+
+let toolCallCount = 0;
 const stream = agentLoop(prompt, context, config);
 
 try {
@@ -129,42 +134,54 @@ try {
 		log(event);
 
 		switch (event.type) {
-			case "tool_execution_start":
-				console.log(`→ ${event.toolName}(${JSON.stringify(event.args)})`);
+			case "agent_start":
+				console.log(`${ts()} Agent started`);
 				break;
 
-			case "tool_execution_end":
-				if (!event.isError) {
-					const text = (event.result.content as any[])
-						.filter((c: any) => c.type === "text")
-						.map((c: any) => c.text)
-						.join("");
-					console.log(`← ${event.toolName}: ${text.slice(0, 120)}${text.length > 120 ? "…" : ""}`);
+			case "turn_start":
+				console.log(`\n${ts()} ── Turn ──`);
+				break;
+
+			case "tool_execution_start":
+				toolCallCount++;
+				console.log(`${ts()} → ${event.toolName}(${JSON.stringify(event.args)})`);
+				break;
+
+			case "tool_execution_end": {
+				const text = (event.result.content as any[])
+					.filter((c: any) => c.type === "text")
+					.map((c: any) => c.text)
+					.join("");
+				const tag = event.isError ? "ERROR" : "OK";
+				const preview = text ? ": " + (text.length > 120 ? text.slice(0, 120) + "…" : text) : "";
+				if (event.isError) {
+					console.error(`${ts()} ← ${event.toolName} [${tag}]${preview}`);
 				} else {
-					console.error(`← ${event.toolName} error: ${(event.result.content as any[])[0]?.text}`);
+					console.log(`${ts()} ← ${event.toolName} [${tag}]${preview}`);
 				}
 				break;
+			}
 
 			case "message_end": {
 				const msg = event.message as any;
 				if (msg.role === "assistant") {
 					if (msg.stopReason === "error") {
 						const errMsg = msg.errorMessage ?? "unknown error";
-						console.error(`\nAPI error: ${errMsg}`);
+						console.error(`${ts()} ⚠ API error: ${errMsg}`);
 						log({ type: "api_error", error: errMsg });
 					}
 					const text = (msg.content as any[])
 						.filter((c: any) => c.type === "text")
 						.map((c: any) => c.text)
 						.join("");
-					if (text) console.log(`\nAssistant: ${text}`);
+					if (text) console.log(`\n${ts()} [Assistant]\n${text}`);
 				}
 				break;
 			}
 
 			case "agent_end":
 				log({ type: "session_end", sessionId });
-				console.log("\nDone.");
+				console.log(`\n${ts()} Agent finished (${toolCallCount} tool calls)`);
 				break;
 		}
 	}
