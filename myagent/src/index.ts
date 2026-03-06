@@ -1,67 +1,52 @@
 import { config as loadEnv } from "dotenv";
 loadEnv({ path: new URL("../../.env", import.meta.url).pathname });
+
 import { getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 import { agentLoop } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { mkdirSync, appendFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
-// Tools
+// MCP browser client — spawns mcp/browser/server.py and wraps its tools
 // ---------------------------------------------------------------------------
 
-const weatherTool = {
-	name: "get_weather",
-	label: "Get Weather",
-	description: "Get the current weather for a city.",
-	parameters: Type.Object({
-		city: Type.String({ description: "The city name to get weather for." }),
-	}),
-	execute: async (_toolCallId: string, { city }: { city: string }) => {
-		// Stub: replace with a real weather API call
-		const temp = Math.round(15 + Math.random() * 20);
-		const conditions = ["sunny", "cloudy", "rainy", "windy"][Math.floor(Math.random() * 4)];
-		return {
-			content: [{ type: "text" as const, text: `Weather in ${city}: ${temp}°C, ${conditions}` }],
-			details: { city, temp, conditions },
-		};
-	},
-};
+async function createBrowserTools() {
+	const serverPath = new URL("../../mcp/browser/server.py", import.meta.url).pathname;
 
-// ---------------------------------------------------------------------------
-// Agent
-// ---------------------------------------------------------------------------
+	const transport = new StdioClientTransport({
+		command: "python3",
+		args: [serverPath],
+	});
 
-const model = getModel("anthropic", "claude-sonnet-4-5");
+	const client = new Client({ name: "myagent", version: "1.0.0" });
+	await client.connect(transport);
 
-const context = {
-	systemPrompt: "You are a helpful assistant. Use tools when needed.",
-	messages: [] as any[],
-	tools: [weatherTool],
-};
+	const { tools: mcpTools } = await client.listTools();
 
-const apiKey = getEnvApiKey("anthropic");
-if (!apiKey) {
-	console.error("Missing ANTHROPIC_API_KEY environment variable.");
-	process.exit(1);
+	const agentTools = mcpTools.map((tool) => ({
+		name: tool.name,
+		label: tool.name,
+		description: tool.description ?? "",
+		// Use Type.Unsafe to pass the MCP JSON Schema through to the LLM unchanged
+		parameters: Type.Unsafe<Record<string, unknown>>(tool.inputSchema as any),
+		execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+			const result = await client.callTool({ name: tool.name, arguments: params });
+			const content = (result.content as any[]).map((c) => {
+				if (c.type === "image") {
+					return { type: "image" as const, data: c.data as string, mimeType: c.mimeType as string };
+				}
+				return { type: "text" as const, text: typeof c.text === "string" ? c.text : JSON.stringify(c) };
+			});
+			return { content, details: {} };
+		},
+	}));
+
+	return { client, agentTools };
 }
-
-const config = {
-	model,
-	apiKey,
-
-	// Pass standard LLM messages through; filter out any custom message types here
-	convertToLlm: (messages: any[]) => messages,
-};
-
-const prompt = [
-	{
-		role: "user" as const,
-		content: "What's the weather like in Tokyo and Paris?",
-		timestamp: Date.now(),
-	},
-];
 
 // ---------------------------------------------------------------------------
 // Session logger — writes one JSON line per event to .myagent/<uuid>.jsonl
@@ -83,12 +68,59 @@ function createSessionLogger(sessionId: string) {
 // Run
 // ---------------------------------------------------------------------------
 
+const apiKey = getEnvApiKey("anthropic");
+if (!apiKey) {
+	console.error("Missing ANTHROPIC_API_KEY environment variable.");
+	process.exit(1);
+}
+
+const model = getModel("anthropic", "claude-sonnet-4-5");
 const sessionId = randomUUID();
 const { file: sessionFile, log } = createSessionLogger(sessionId);
 
 console.log("Starting agent...\n");
 console.log(`Session log: ${sessionFile}\n`);
+
+const { client: mcpClient, agentTools } = await createBrowserTools();
+
+const prompt = [
+	{
+		role: "user" as const,
+		content: "Go to https://news.ycombinator.com and tell me the top 5 story titles.",
+		timestamp: Date.now(),
+	},
+];
+
 log({ type: "session_start", sessionId, model: model.id, prompt });
+
+const context = {
+	systemPrompt:
+		"You are a browser automation agent. Use the browser tools to navigate and extract information from web pages.",
+	messages: [] as any[],
+	tools: agentTools,
+};
+
+const config = {
+	model,
+	apiKey,
+	// Sanitise tool results before sending to the LLM:
+	//   - drop image content (base64 screenshots blow up the context window)
+	//   - truncate long text to 8 000 characters
+	convertToLlm: (messages: any[]) =>
+		messages.map((msg) => {
+			if (msg.role !== "toolResult") return msg;
+			return {
+				...msg,
+				content: (msg.content as any[])
+					.filter((c: any) => c.type !== "image")
+					.map((c: any) =>
+						c.type === "text" && c.text.length > 8000
+							? { ...c, text: c.text.slice(0, 8000) + "\n…[truncated]" }
+							: c,
+					),
+			};
+		}),
+};
 
 const stream = agentLoop(prompt, context, config);
 
@@ -107,9 +139,9 @@ try {
 						.filter((c: any) => c.type === "text")
 						.map((c: any) => c.text)
 						.join("");
-					console.log(`← ${event.toolName}: ${text}`);
+					console.log(`← ${event.toolName}: ${text.slice(0, 120)}${text.length > 120 ? "…" : ""}`);
 				} else {
-					console.error(`← ${event.toolName} error: ${event.result.content[0]?.text}`);
+					console.error(`← ${event.toolName} error: ${(event.result.content as any[])[0]?.text}`);
 				}
 				break;
 
@@ -140,5 +172,6 @@ try {
 	const errMsg = e instanceof Error ? e.message : String(e);
 	log({ type: "fatal_error", error: errMsg });
 	console.error("Agent error:", errMsg);
-	process.exit(1);
+} finally {
+	await mcpClient.close();
 }
