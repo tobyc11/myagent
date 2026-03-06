@@ -6,9 +6,10 @@ import { agentLoop } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdirSync, appendFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
 
 // ---------------------------------------------------------------------------
 // MCP browser client — spawns mcp/browser/server.py and wraps its tools
@@ -78,6 +79,45 @@ const model = getModel("anthropic", "claude-sonnet-4-5");
 const sessionId = randomUUID();
 const { file: sessionFile, log } = createSessionLogger(sessionId);
 
+// ---------------------------------------------------------------------------
+// Resolve prompt from CLI arg, file, or stdin
+// ---------------------------------------------------------------------------
+
+async function resolvePrompt(): Promise<string> {
+	const arg = process.argv[2];
+
+	if (arg) {
+		// If it looks like a file path and exists, read it
+		if (existsSync(arg)) {
+			return readFileSync(arg, "utf8").trim();
+		}
+		// Otherwise treat the argument itself as the prompt
+		return arg;
+	}
+
+	// No arg — read from stdin (supports pipe or interactive input)
+	if (!process.stdin.isTTY) {
+		const chunks: string[] = [];
+		for await (const chunk of process.stdin) chunks.push(chunk);
+		return chunks.join("").trim();
+	}
+
+	// Interactive: prompt the user
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((resolve) => {
+		rl.question("Prompt: ", (answer) => {
+			rl.close();
+			resolve(answer.trim());
+		});
+	});
+}
+
+const promptText = await resolvePrompt();
+if (!promptText) {
+	console.error("No prompt provided.");
+	process.exit(1);
+}
+
 console.log("Starting agent...\n");
 console.log(`Session log: ${sessionFile}\n`);
 
@@ -86,7 +126,7 @@ const { client: mcpClient, agentTools } = await createBrowserTools();
 const prompt = [
 	{
 		role: "user" as const,
-		content: "Go to https://news.ycombinator.com and tell me the top 5 story titles.",
+		content: promptText,
 		timestamp: Date.now(),
 	},
 ];
