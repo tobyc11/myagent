@@ -1,8 +1,10 @@
+import { config as loadEnv } from "dotenv";
+loadEnv({ path: new URL("../../.env", import.meta.url).pathname });
 import { getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 import { agentLoop } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import { mkdirSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
