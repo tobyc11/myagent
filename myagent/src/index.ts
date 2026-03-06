@@ -133,11 +133,47 @@ const prompt = [
 
 log({ type: "session_start", sessionId, model: model.id, prompt });
 
+const searchTool = {
+	name: "search",
+	label: "search",
+	description:
+		"Search the web using Brave Search API. Returns titles, URLs, and descriptions. " +
+		"Use this instead of navigating to google.com — faster and avoids CAPTCHAs.",
+	parameters: Type.Object({
+		query: Type.String({ description: "Search query" }),
+		count: Type.Optional(Type.Number({ description: "Number of results (default 10, max 20)" })),
+	}),
+	execute: async (_toolCallId: string, params: { query: string; count?: number }) => {
+		const apiKey = process.env.BRAVE_API_KEY ?? "";
+		if (!apiKey) return { content: [{ type: "text" as const, text: "Error: BRAVE_API_KEY not set" }], details: {} };
+		const count = Math.min(params.count ?? 10, 20);
+		const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(params.query)}&count=${count}`;
+		try {
+			const resp = await fetch(url, {
+				headers: { Accept: "application/json", "X-Subscription-Token": apiKey },
+			});
+			const data = await resp.json() as any;
+			const results = (data?.web?.results ?? []) as any[];
+			const text = results.map((r: any, i: number) =>
+				`${i + 1}. ${r.title}\n   ${r.url}\n   ${r.description ?? ""}`
+			).join("\n\n") || "No results found";
+			return { content: [{ type: "text" as const, text }], details: {} };
+		} catch (e) {
+			return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {} };
+		}
+	},
+};
+
 const context = {
-	systemPrompt:
-		"You are a browser automation agent. Use the browser tools to navigate and extract information from web pages.",
+	systemPrompt: `You are a browser automation agent. Use the browser tools to navigate and extract information from web pages.
+
+Tool usage guidelines:
+- search(): Always prefer this over navigating to Google/Bing. It returns structured results instantly.
+- navigate(), go_back(), go_forward(), new_tab(): These already return the page title and top headings. Only call observe() afterwards if you need the full interactive element tree to click something or the heading summary is insufficient.
+- observe(): Use selector= to scope the ARIA tree when you only care about a specific section (e.g. selector="main", selector="article"). Avoid full-page observe on content-heavy sites.
+- Cookie/consent dialogs are dismissed automatically after navigation — do not try to click them yourself unless observe() shows one is still present.`,
 	messages: [] as any[],
-	tools: agentTools,
+	tools: [...agentTools, searchTool],
 };
 
 const config = {

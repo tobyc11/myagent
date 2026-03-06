@@ -15,6 +15,7 @@ Config (env vars):
 import asyncio
 import base64
 import os
+import re
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -35,6 +36,25 @@ _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
 _pages: list[Page] = []
 _active_idx: int = 0
+
+MAX_ARIA_CHARS = 20_000
+
+_CONSENT_LABELS = [
+    "Accept all", "Accept All", "Accept and continue", "Accept",
+    "I agree", "Agree", "Allow all", "Allow cookies",
+    "OK", "Got it", "Consent", "Continue",
+]
+
+
+async def _try_dismiss_consent(page: Page) -> None:
+    for label in _CONSENT_LABELS:
+        try:
+            btn = page.get_by_role("button", name=label)
+            if await btn.count() > 0:
+                await btn.first.click(timeout=1500)
+                return
+        except Exception:
+            continue
 
 async def _get_active_page() -> Page:
     """Return the active page, launching a browser if needed."""
@@ -98,6 +118,10 @@ def _make_locator(page: Page, target: str):
         return page.get_by_text(target[5:], exact=True)
     if target.startswith("css=") or target.startswith("#") or target.startswith("."):
         return page.locator(target.removeprefix("css="))
+    # ARIA snapshot format: "word "text"" → get_by_role
+    m = re.match(r'^(\w+)\s+"(.+)"$', target)
+    if m:
+        return page.get_by_role(m.group(1), name=m.group(2))  # type: ignore[arg-type]
     # Default: partial text match
     return page.get_by_text(target)
 
@@ -113,10 +137,16 @@ mcp = FastMCP("browser")
 
 
 @mcp.tool()
-async def observe(include_screenshot: bool = True) -> list:
+async def observe(include_screenshot: bool = True, selector: str = "body") -> list:
     """
     Primary perception tool. Call this before acting and again after each action
     to verify the result.
+
+    Args:
+      include_screenshot: set False to skip the screenshot and only get the ARIA tree.
+      selector: CSS selector to scope the ARIA snapshot (default "body").
+                Use "main", "article", "#content" to get a smaller tree when the
+                full page ARIA tree is too large.
 
     Returns:
       - Current URL and title
@@ -130,7 +160,9 @@ async def observe(include_screenshot: bool = True) -> list:
         page = await _get_active_page()
         title = await page.title()
         url = page.url
-        aria_text = await page.locator("body").aria_snapshot()
+        aria_text = await page.locator(selector).aria_snapshot()
+        if len(aria_text) > MAX_ARIA_CHARS:
+            aria_text = aria_text[:MAX_ARIA_CHARS] + "\n…[ARIA tree truncated — use observe(selector=...) to scope]"
         header = f"URL: {url}\nTitle: {title}\n\nAccessibility tree:\n{aria_text}"
 
         result = [{"type": "text", "text": header}]
@@ -154,34 +186,70 @@ async def observe(include_screenshot: bool = True) -> list:
 
 @mcp.tool()
 async def navigate(url: str) -> str:
-    """Navigate the active tab to a URL. Waits for the page to load. Call observe() after to see the result."""
+    """Navigate the active tab to a URL. Waits for the page to load. Returns title and top headings so you often don't need a follow-up observe()."""
     try:
         page = await _get_active_page()
         response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         status = response.status if response else "?"
-        return f"Navigated to {page.url} (HTTP {status})"
+        title = await page.title()
+        headings = await page.evaluate(
+            "Array.from(document.querySelectorAll('h1,h2')).slice(0,5)"
+            ".map(h=>h.innerText.trim()).filter(Boolean)"
+        )
+        summary = f"Navigated to {page.url} (HTTP {status})\nTitle: {title}"
+        if headings:
+            summary += "\nTop headings: " + " | ".join(headings)
+        try:
+            await _try_dismiss_consent(page)
+        except Exception:
+            pass
+        return summary
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
 async def go_back() -> str:
-    """Navigate back in browser history. Call observe() after to see where you landed."""
+    """Navigate back in browser history. Returns title and top headings."""
     try:
         page = await _get_active_page()
         await page.go_back(wait_until="domcontentloaded")
-        return f"Went back to {page.url}"
+        title = await page.title()
+        headings = await page.evaluate(
+            "Array.from(document.querySelectorAll('h1,h2')).slice(0,5)"
+            ".map(h=>h.innerText.trim()).filter(Boolean)"
+        )
+        summary = f"Went back to {page.url}\nTitle: {title}"
+        if headings:
+            summary += "\nTop headings: " + " | ".join(headings)
+        try:
+            await _try_dismiss_consent(page)
+        except Exception:
+            pass
+        return summary
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
 async def go_forward() -> str:
-    """Navigate forward in browser history. Call observe() after to see where you landed."""
+    """Navigate forward in browser history. Returns title and top headings."""
     try:
         page = await _get_active_page()
         await page.go_forward(wait_until="domcontentloaded")
-        return f"Went forward to {page.url}"
+        title = await page.title()
+        headings = await page.evaluate(
+            "Array.from(document.querySelectorAll('h1,h2')).slice(0,5)"
+            ".map(h=>h.innerText.trim()).filter(Boolean)"
+        )
+        summary = f"Went forward to {page.url}\nTitle: {title}"
+        if headings:
+            summary += "\nTop headings: " + " | ".join(headings)
+        try:
+            await _try_dismiss_consent(page)
+        except Exception:
+            pass
+        return summary
     except Exception as e:
         return f"Error: {e}"
 
@@ -208,7 +276,7 @@ async def list_tabs() -> str:
 
 @mcp.tool()
 async def new_tab(url: str = "about:blank") -> str:
-    """Open a new browser tab, optionally navigating to a URL."""
+    """Open a new browser tab, optionally navigating to a URL. Returns title and top headings."""
     global _pages, _active_idx
     try:
         await _get_active_page()  # ensures _context is set
@@ -217,6 +285,19 @@ async def new_tab(url: str = "about:blank") -> str:
         _active_idx = len(_pages) - 1
         if url != "about:blank":
             await page.goto(url, wait_until="domcontentloaded")
+            title = await page.title()
+            headings = await page.evaluate(
+                "Array.from(document.querySelectorAll('h1,h2')).slice(0,5)"
+                ".map(h=>h.innerText.trim()).filter(Boolean)"
+            )
+            summary = f"Opened tab [{_active_idx}]: {page.url}\nTitle: {title}"
+            if headings:
+                summary += "\nTop headings: " + " | ".join(headings)
+            try:
+                await _try_dismiss_consent(page)
+            except Exception:
+                pass
+            return summary
         return f"Opened tab [{_active_idx}]: {page.url}"
     except Exception as e:
         return f"Error: {e}"
