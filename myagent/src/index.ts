@@ -1,6 +1,9 @@
 import { getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 import { agentLoop } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
+import { mkdirSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -59,15 +62,38 @@ const prompt = [
 ];
 
 // ---------------------------------------------------------------------------
+// Session logger — writes one JSON line per event to .myagent/<uuid>.jsonl
+// ---------------------------------------------------------------------------
+
+function createSessionLogger(sessionId: string) {
+	const dir = join(process.cwd(), ".myagent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, `${sessionId}.jsonl`);
+
+	function log(record: object) {
+		appendFileSync(file, JSON.stringify({ ts: Date.now(), ...record }) + "\n");
+	}
+
+	return { file, log };
+}
+
+// ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
 
+const sessionId = randomUUID();
+const { file: sessionFile, log } = createSessionLogger(sessionId);
+
 console.log("Starting agent...\n");
+console.log(`Session log: ${sessionFile}\n`);
+log({ type: "session_start", sessionId, model: model.id, prompt });
 
 const stream = agentLoop(prompt, context, config);
 
 try {
 	for await (const event of stream) {
+		log(event);
+
 		switch (event.type) {
 			case "tool_execution_start":
 				console.log(`→ ${event.toolName}(${JSON.stringify(event.args)})`);
@@ -89,7 +115,9 @@ try {
 				const msg = event.message as any;
 				if (msg.role === "assistant") {
 					if (msg.stopReason === "error") {
-						console.error(`\nAPI error: ${msg.errorMessage ?? "unknown error"}`);
+						const errMsg = msg.errorMessage ?? "unknown error";
+						console.error(`\nAPI error: ${errMsg}`);
+						log({ type: "api_error", error: errMsg });
 					}
 					const text = (msg.content as any[])
 						.filter((c: any) => c.type === "text")
@@ -101,11 +129,14 @@ try {
 			}
 
 			case "agent_end":
+				log({ type: "session_end", sessionId });
 				console.log("\nDone.");
 				break;
 		}
 	}
 } catch (e) {
-	console.error("Agent error:", e instanceof Error ? e.message : e);
+	const errMsg = e instanceof Error ? e.message : String(e);
+	log({ type: "fatal_error", error: errMsg });
+	console.error("Agent error:", errMsg);
 	process.exit(1);
 }
